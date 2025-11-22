@@ -1,3 +1,5 @@
+import os
+os.environ["TZ"] = "UTC"
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
@@ -28,3 +30,4 @@ try:
 except Exception as e:
     st.error("Error connecting to Google Sheet")
     st.error(e)
+
