@@ -90,6 +90,7 @@ if not st.session_state["logged_in"]:
     st.stop()
 
 st.success(f"Logged in as **{st.session_state['username']}** ({st.session_state['role']})")
+
 # -----------------------------------------------------------
 # COLUMN PERMISSION GROUPS (BASED ON YOUR MATRIX)
 # -----------------------------------------------------------
@@ -109,11 +110,9 @@ FINANCE_COLUMNS = ["M","P","S","U"]
 
 KHYATEE_ONLY = ["K","AC"]
 
-
 # -----------------------------------------------------------
-# ROLE → PERMISSION MAPPING
+# ROLE → COLUMN PERMISSION
 # -----------------------------------------------------------
-
 ROLE_PERMISSIONS = {
     "admin": ADMIN_COLUMNS + DELIVERY_COLUMNS + PAYMENT_COLUMNS + FINANCE_COLUMNS + KHYATEE_ONLY,
     "delivery": DELIVERY_COLUMNS,
@@ -121,7 +120,6 @@ ROLE_PERMISSIONS = {
     "finance": FINANCE_COLUMNS,
     "multi": DELIVERY_COLUMNS + PAYMENT_COLUMNS + FINANCE_COLUMNS + KHYATEE_ONLY
 }
-
 
 # -----------------------------------------------------------
 # GOOGLE SHEETS CONNECTION
@@ -144,100 +142,86 @@ WORKBOOK_NAME = "SSC Workflow Main DB"
 # -----------------------------------------------------------
 # LOAD SHEET DROPDOWN
 # -----------------------------------------------------------
-
 st.subheader("📄 Select Brand Sheet")
 SHEET_NAMES = ["GODREJ", "LG", "WHIRLPOOL", "UNILINE", "LLOYD"]
 
 selected_sheet = st.selectbox("Choose a sheet:", SHEET_NAMES)
-
 sheet = client.open(WORKBOOK_NAME).worksheet(selected_sheet)
 
 # -----------------------------------------------------------
 # LOAD DATAFRAME
 # -----------------------------------------------------------
-
-data = sheet.get_all_records()  # row1 = headers
+data = sheet.get_all_records()
 df = pd.DataFrame(data)
-
-# Store original for locking comparison
 original_df = df.copy()
+
 # -----------------------------------------------------------
-# FIND COLUMN LETTER FROM INDEX
+# HELPERS
 # -----------------------------------------------------------
 def col_letter(idx):
-    """Convert DataFrame index (0-based) → Excel column letter."""
     return chr(ord('A') + idx)
 
 # -----------------------------------------------------------
-# BUILD EDITABLE MASK
+# DETERMINE EDITABLE COLS
 # -----------------------------------------------------------
+
 user_role = st.session_state["role"]
 allowed_cols = ROLE_PERMISSIONS[user_role]
 
 editable_columns = []
 for i, col in enumerate(df.columns):
     letter = col_letter(i)
-    if letter in allowed_cols:
+    if letter in allowed_cols or user_role == "admin":
         editable_columns.append(col)
 
 # -----------------------------------------------------------
-# LOCKING LOGIC (AUTO-LOCK AFTER FIRST EDIT)
+# LOCK SHEET
 # -----------------------------------------------------------
 LOCK_SHEET_NAME = "LOCKS"
 
-# Ensure lock sheet exists
 try:
     lock_sheet = client.open(WORKBOOK_NAME).worksheet(LOCK_SHEET_NAME)
 except:
-    # Create LOCKS sheet
     client.open(WORKBOOK_NAME).add_worksheet(LOCK_SHEET_NAME, rows=5000, cols=10)
     lock_sheet = client.open(WORKBOOK_NAME).worksheet(LOCK_SHEET_NAME)
     lock_sheet.append_row(["sheet", "row", "column", "locked"])
 
-# Load existing locks
 lock_data = lock_sheet.get_all_records()
 lock_df = pd.DataFrame(lock_data)
 
-def is_cell_locked(sheet_name, row, col_letter):
+def is_cell_locked(sheet_name, row, col_l):
     if lock_df.empty:
         return False
-    query = lock_df[
+    q = lock_df[
         (lock_df["sheet"] == sheet_name) &
         (lock_df["row"] == row) &
-        (lock_df["column"] == col_letter) &
+        (lock_df["column"] == col_l) &
         (lock_df["locked"] == "yes")
     ]
-    return not query.empty
-
+    return not q.empty
 
 # -----------------------------------------------------------
-# APPLY LOCKS TO EDITABLE COLUMNS
+# FILTER FINAL EDITABLE COLUMNS
 # -----------------------------------------------------------
 final_editable_cols = []
 for i, col in enumerate(df.columns):
-    col_l = col_letter(i)
-    
+    letter = col_letter(i)
+
     if col not in editable_columns:
-        continue  # user not allowed this column
-
-    # Check each row if it is locked or originally filled
-    locked_rows = []
-    for r in range(len(df)):
-        if original_df.iloc[r, i] not in [None, "", " "]:
-            locked_rows.append(r)
-
-        if is_cell_locked(selected_sheet, r+2, col_l):
-            locked_rows.append(r)
-
-    # If all rows are locked, skip making this column editable
-    if len(locked_rows) == len(df):
         continue
 
-    final_editable_cols.append(col)
+    locked_rows = []
+    for r in range(len(df)):
+        if original_df.iloc[r, i] not in ["", None, " ", "nan"]:
+            locked_rows.append(r)
+        if is_cell_locked(selected_sheet, r+2, letter):
+            locked_rows.append(r)
 
+    if len(locked_rows) != len(df):
+        final_editable_cols.append(col)
 
 # -----------------------------------------------------------
-# DATA EDITOR DISPLAY
+# EDITOR
 # -----------------------------------------------------------
 st.subheader("📋 Editable Table")
 
@@ -246,7 +230,6 @@ edited_df = st.data_editor(
     use_container_width=True,
     disabled=[c for c in df.columns if c not in final_editable_cols]
 )
-
 # -----------------------------------------------------------
 # DETECT CHANGES
 # -----------------------------------------------------------
@@ -257,136 +240,131 @@ for r in range(len(df)):
         old = original_df.iloc[r, c]
         new = edited_df.iloc[r, c]
 
-        if old != new:
+        if str(old) != str(new):
             col_l = col_letter(c)
 
-            # check lock
-            if is_cell_locked(selected_sheet, r+2, col_l) and user_role != "admin":
-                st.error(f"You cannot edit locked cell: Row {r+2}, Column {col_l}")
+            # Permission check
+            if col_name not in final_editable_cols:
+                st.error(f"❌ Permission denied for column {col_name} ({col_l})")
                 st.stop()
 
-            # if user doesn't have permission → block
-            if col_name not in final_editable_cols:
-                st.error(f"Permission denied for column {col_name} ({col_l})")
+            # Lock check
+            if is_cell_locked(selected_sheet, r+2, col_l):
+                st.error(f"❌ Cell already locked: Row {r+2}, Col {col_l}")
                 st.stop()
 
             changes.append({
-                "row": r + 2,  # because row1 = header
+                "row": r + 2,
                 "column": col_l,
                 "old": old,
                 "new": new
             })
+
 # -----------------------------------------------------------
-# LOG SHEET SETUP
+# LOG SHEET
 # -----------------------------------------------------------
 LOG_SHEET_NAME = "LOGS"
 
-# Ensure LOGS sheet exists
 try:
     log_sheet = client.open(WORKBOOK_NAME).worksheet(LOG_SHEET_NAME)
 except:
     client.open(WORKBOOK_NAME).add_worksheet(LOG_SHEET_NAME, rows=5000, cols=10)
     log_sheet = client.open(WORKBOOK_NAME).worksheet(LOG_SHEET_NAME)
-    log_sheet.append_row(["timestamp", "user", "sheet", "row", "column", "old_value", "new_value"])
-
+    log_sheet.append_row([
+        "timestamp","user","sheet","row","column","old_value","new_value"
+    ])
 
 # -----------------------------------------------------------
-# SAVE CHANGES BUTTON
+# SAVE BLOCK
 # -----------------------------------------------------------
 st.markdown("---")
 st.subheader("💾 Save Changes")
 
 if changes:
-    st.write("Pending changes:")
+    st.write("Changes detected:")
     st.dataframe(pd.DataFrame(changes))
 
     if st.button("✅ Save changes to Google Sheets"):
-        # Apply all changes
-        for change in changes:
-            row_num = change["row"]          # Google Sheets row (2+)
-            col_l = change["column"]        # Column letter
-            old_val = change["old"]
-            new_val = change["new"]
+        for ch in changes:
+            row = ch["row"]
+            col_l = ch["column"]
+            new = ch["new"]
+            old = ch["old"]
 
-            # Convert column letter to index (1-based)
-            col_idx = ord(col_l) - ord('A') + 1
+            # Convert letter → index
+            col_idx = ord(col_l) - ord("A") + 1
 
-            # Update in sheet
-            sheet.update_cell(row_num, col_idx, "" if new_val is None else str(new_val))
+            # Update Google Sheet
+            sheet.update_cell(row, col_idx, "" if new is None else str(new))
 
-            # Lock this cell
-            lock_sheet.append_row([selected_sheet, row_num, col_l, "yes"])
+            # Lock the cell
+            lock_sheet.append_row([
+                selected_sheet,
+                row,
+                col_l,
+                "yes"
+            ])
 
-            # Log the edit
+            # Log the event
             log_sheet.append_row([
                 datetime.now().isoformat(timespec="seconds"),
                 st.session_state["username"],
                 selected_sheet,
-                row_num,
+                row,
                 col_l,
-                "" if old_val is None else str(old_val),
-                "" if new_val is None else str(new_val)
+                "" if old is None else str(old),
+                "" if new is None else str(new)
             ])
 
-        st.success("Changes saved, cells locked, and logs updated.")
+        st.success("✅ Changes saved, locked, and logged.")
         st.experimental_rerun()
-else:
-    st.info("No changes detected. Edit the table above to enable saving.")
 
+else:
+    st.info("No changes detected.")
 
 # -----------------------------------------------------------
 # ADMIN UNLOCK PANEL
 # -----------------------------------------------------------
 st.markdown("---")
-if user_role == "admin":
-    st.subheader("🔓 Admin: Unlock Locked Cell")
+if st.session_state["role"] == "admin":
+    st.subheader("🔓 Admin Unlock Cell")
 
-    unlock_sheet_name = st.selectbox(
-        "Choose sheet to unlock from:",
-        SHEET_NAMES,
-        key="unlock_sheet_select"
-    )
-    unlock_row = st.number_input("Row number (2 or higher)", min_value=2, step=1)
-    unlock_col = st.text_input("Column letter (e.g., H, AA, AP)").strip().upper()
+    unlock_sheet = st.selectbox("Sheet:", SHEET_NAMES)
+    unlock_row = st.number_input("Row number", min_value=2, step=1)
+    unlock_col = st.text_input("Column letter", max_chars=3).upper().strip()
 
-    if st.button("Unlock cell"):
-        if not unlock_col:
-            st.error("Please enter a column letter.")
+    if st.button("Unlock"):
+        all_locks = lock_sheet.get_all_values()
+
+        if len(all_locks) <= 1:
+            st.warning("No locks found.")
         else:
-            # Reload all lock entries
-            all_lock_values = lock_sheet.get_all_values()
-            if len(all_lock_values) <= 1:
-                st.warning("No locks found.")
+            headers = all_locks[0]
+            new_values = [headers]
+            removed = False
+
+            for rowvals in all_locks[1:]:
+                d = dict(zip(headers, rowvals))
+
+                # Match
+                if (
+                    d["sheet"] == unlock_sheet and
+                    d["row"] == str(int(unlock_row)) and
+                    d["column"] == unlock_col and
+                    d["locked"] == "yes"
+                ):
+                    removed = True
+                    continue
+
+                new_values.append(rowvals)
+
+            if removed:
+                lock_sheet.clear()
+                lock_sheet.update("A1", new_values)
+                st.success(f"Unlocked {unlock_sheet}! R{int(unlock_row)}C{unlock_col}")
+                st.experimental_rerun()
             else:
-                headers = all_lock_values[0]
-                new_values = [headers]
-                modified = False
+                st.warning("No matching lock found.")
 
-                for rowvals in all_lock_values[1:]:
-                    row_dict = dict(zip(headers, rowvals))
-
-                    # Match by sheet, row, column and locked=='yes'
-                    if (
-                        row_dict.get("sheet") == unlock_sheet_name and
-                        str(row_dict.get("row")) == str(int(unlock_row)) and
-                        row_dict.get("column") == unlock_col and
-                        row_dict.get("locked") == "yes"
-                    ):
-                        # Skip this row to remove the lock
-                        modified = True
-                        continue
-
-                    new_values.append(rowvals)
-
-                if modified:
-                    # Rewrite LOCKS sheet without the removed lock rows
-                    lock_sheet.clear()
-                    lock_sheet.update("A1", new_values)
-                    st.success(
-                        f"Unlocked cell {unlock_sheet_name}!R{int(unlock_row)}C{unlock_col}"
-                    )
-                    st.experimental_rerun()
-                else:
-                    st.warning("No matching locked cell found.")
 else:
-    st.info("Admin unlock panel is only visible to admin users (siddarth / info).")
+    st.info("Admin-only panel.")
